@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import cv2
 import igraph as ig
@@ -47,8 +49,8 @@ def initalize_GMMs(img, mask):
     # TODO: implement initalize_GMMs
     bgGMM = GaussianMixture(n_components=5, random_state=0)
     fgGMM = GaussianMixture(n_components=5, random_state=0)
-    bgGMM.fit(img.reshape(-1,3))
-    fgGMM.fit(mask.reshape(-1,3))
+    bgGMM.fit(img.reshape(-1, 3))
+    fgGMM.fit(mask.reshape(-1, 3))
 
     return bgGMM, fgGMM
 
@@ -56,12 +58,13 @@ def initalize_GMMs(img, mask):
 # Define helper functions for the GrabCut algorithm
 def update_GMMs(img, mask, bgGMM, fgGMM):
     # TODO: implement GMM component assignment step
-    bgGMM.fit(img.reshape(-1,3))
-    fgGMM.fit(mask.reshape(-1,3))
+    bgGMM.fit(img.reshape(-1, 3))
+    fgGMM.fit(mask.reshape(-1, 3))
     return bgGMM, fgGMM
 
 
 def calculate_mincut(img, mask, bgGMM, fgGMM):
+    t1 = time.time()
     # TODO: implement energy (cost) calculation step and mincut
     height, width = img.shape[:2]
     g = ig.Graph(directed=False)
@@ -71,27 +74,33 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
     sink_index = source_index + 1  # fg
     beta = 1 / (2 * np.mean((img[:-1, :-1] - img[1:, 1:]) ** 2))
     gamma = 50
-    print("predict:")
     bg_img_prob = bgGMM.predict_proba(img.reshape(-1, 3))
     fg_img_prob = fgGMM.predict_proba(img.reshape(-1, 3))
-    print(f"for 1 start h:{height} w:{width}")
-    for row_index in range(0, height):
-        print("row")
-        for col_index in range(0, width):
-            g.add_edge(row_index * width + col_index, source_index, weight=bg_img_prob[row_index * width + col_index].max())
-            g.add_edge(row_index * width + col_index, sink_index, weight=fg_img_prob[row_index * width + col_index].max())
-    print("for 2 start")
+    src_weights = bg_img_prob.max(axis=1)
+    sink_weights = fg_img_prob.max(axis=1)
+    src_edges = [(i, source_index) for i in range(height * width)]
+    sink_edges = [(i, sink_index) for i in range(height * width)]
+
+    tween_edges = []
+    tween_weights = []
     for row_index in range(0, height):
         for col_index in range(0, width):
             nei_list = neighborhood(row_index, col_index, width, height)
             pixel_index = col_index + width * row_index
             for nei in nei_list:
-                w = gamma * np.exp(-1 * beta * np.linalg.norm(img[row_index, col_index] - img[nei[0, nei[1]]]) ** 2) * (
+                w = gamma * np.exp(-1 * beta * np.linalg.norm(img[row_index, col_index] - img[nei[0], nei[1]]) ** 2) * (
                         (
                                 (row_index - nei[0]) ** 2 + (col_index - nei[1]) ** 2) ** -0.5)
-                g.add_edge(pixel_index, nei[0] * width + nei[1], weight=w)
+                tween_edges.append((pixel_index, nei[0] * width + nei[1]))
+                tween_weights.append(w)
+
+    g.add_edges(src_edges)
+    g.add_edges(sink_edges)
+    g.add_edges(tween_edges)
+    g.es['weight'] = np.concatenate([src_weights, sink_weights, tween_weights])
     min_cut = g.mincut(source=source_index, target=sink_index).partition  # [[], []]
     energy = g.mincut_value(source=source_index, target=sink_index)
+    print(time.time() - t1)  # time = 13.0004
     return min_cut, energy
 
 
@@ -106,7 +115,7 @@ def neighborhood(row_index, col_index, max_width, max_height) -> np.ndarray:
 
 
 def update_mask(mincut_sets, mask):
-    #TODO findout how the cutsets looks like
+    # TODO findout how the cutsets looks like
     height, width = mask.shape[:2]
     for row in height:
         for col in width:
