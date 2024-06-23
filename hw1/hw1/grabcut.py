@@ -49,17 +49,22 @@ def initalize_GMMs(img, mask):
     # TODO: implement initalize_GMMs
     bgGMM = GaussianMixture(n_components=5, random_state=0)
     fgGMM = GaussianMixture(n_components=5, random_state=0)
-    bgGMM.fit(img.reshape(-1, 3))
-    fgGMM.fit(mask.reshape(-1, 3))
-
+    # bgGMM.fit(img.reshape(-1, 3))
+    # fgGMM.fit(mask.reshape(-1, 3))
+    background_pixels = img[mask == 0]
+    foreground_pixels = img[mask == 3]
+    bgGMM.fit(background_pixels)
+    fgGMM.fit(foreground_pixels)
     return bgGMM, fgGMM
 
 
 # Define helper functions for the GrabCut algorithm
 def update_GMMs(img, mask, bgGMM, fgGMM):
     # TODO: implement GMM component assignment step
-    bgGMM.fit(img.reshape(-1, 3))
-    fgGMM.fit(mask.reshape(-1, 3))
+    background_pixels = img[mask <= 2]
+    foreground_pixels = img[mask == 3]
+    bgGMM.fit(background_pixels)
+    fgGMM.fit(foreground_pixels)
     return bgGMM, fgGMM
 
 
@@ -68,37 +73,62 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
     # TODO: implement energy (cost) calculation step and mincut
     height, width = img.shape[:2]
     g = ig.Graph(directed=False)
+
     g.add_vertices(height * width + 2)
     # Last 2 vertices are the source and the sink.
     source_index = height * width  # bg
     sink_index = source_index + 1  # fg
-    beta = 1 / (2 * np.mean((img[:-1, :-1] - img[1:, 1:]) ** 2))
-    gamma = 50
-    bg_img_prob = bgGMM.predict_proba(img.reshape(-1, 3))
-    fg_img_prob = fgGMM.predict_proba(img.reshape(-1, 3))
-    src_weights = bg_img_prob.max(axis=1)
-    sink_weights = fg_img_prob.max(axis=1)
-    src_edges = [(i, source_index) for i in range(height * width)]
-    sink_edges = [(i, sink_index) for i in range(height * width)]
 
-    tween_edges = []
-    tween_weights = []
+    src_edges = [(source_index, i) for i in range(height * width)]
+    sink_edges = [(i, sink_index) for i in range(height * width)]
+    beta = 1 / (2 * np.mean((img[:-1, :-1] - img[1:, 1:]) ** 2))
+
+    between_edges = []
+    between_weights = []
+    K = 0
     for row_index in range(0, height):
         for col_index in range(0, width):
             nei_list = neighborhood(row_index, col_index, width, height)
             pixel_index = col_index + width * row_index
+            sum_n = 0
+            ##beta_sum = 0
+            ##for nei in nei_list:
+            ##  beta_sum += np.linalg.norm(img[row_index, col_index] - img[nei[0], nei[1]]) ** 2
+            ##beta = 1 / (2 * (beta_sum/len(nei_list)))
             for nei in nei_list:
-                w = gamma * np.exp(-1 * beta * np.linalg.norm(img[row_index, col_index] - img[nei[0], nei[1]]) ** 2) * (
-                        (
-                                (row_index - nei[0]) ** 2 + (col_index - nei[1]) ** 2) ** -0.5)
-                tween_edges.append((pixel_index, nei[0] * width + nei[1]))
-                tween_weights.append(w)
+                N = (50 * np.exp(-1 * beta * np.linalg.norm(img[row_index, col_index] - img[nei[0], nei[1]]) ** 2) *
+                     (((row_index - nei[0]) ** 2 + (col_index - nei[1]) ** 2) ** -0.5))
+                sum_n += N
+                between_edges.append((pixel_index, nei[0] * width + nei[1]))
+                between_weights.append(N)
+            K = max(K, sum_n)
+
+    ##bg_img_prob = bgGMM.predict_proba(img.reshape(-1, 3)).max(axis=1)
+    ##fg_img_prob = fgGMM.predict_proba(img.reshape(-1, 3)).max(axis=1)
+    bg_img_prob = -np.log(bgGMM.predict_proba(img.reshape(-1, 3))).min(axis=1)
+    fg_img_prob = -np.log(fgGMM.predict_proba(img.reshape(-1, 3))).min(axis=1)
+    ###fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    ###bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+
+    src_weights = []  #
+    sink_weights = []  #
+    print(f"K={K}")
+    for row_index in range(0, height):
+        for col_index in range(0, width):
+            if mask[row_index][col_index] == 0:
+                src_weights.append(K)  # if we know its bg, the wight should be K
+                sink_weights.append(0)
+            else:  # If the mask is 2 or 3, use the prob
+                # sink_weights.append(bg_img_prob[row_index][col_index])
+                sink_weights.append(bg_img_prob[row_index * width + col_index])
+                # src_weights.append(fg_img_prob[row_index][col_index])
+                src_weights.append(fg_img_prob[row_index * width + col_index])
 
     g.add_edges(src_edges)
     g.add_edges(sink_edges)
-    g.add_edges(tween_edges)
-    g.es['weight'] = np.concatenate([src_weights, sink_weights, tween_weights])
-    min_cut = g.mincut(source=source_index, target=sink_index).partition  # [[], []]
+    g.add_edges(between_edges)
+    g.es['weight'] = np.concatenate([src_weights, sink_weights, between_weights])
+    min_cut = g.mincut(source=source_index, target=sink_index, capacity='weight').partition  # [[], []]
     energy = g.mincut_value(source=source_index, target=sink_index)
     print(time.time() - t1)  # time = 13.0004
     return min_cut, energy
@@ -108,26 +138,35 @@ def neighborhood(row_index, col_index, max_width, max_height) -> np.ndarray:
     neighborhood_list = []
     for i in range(-1, 2):
         for j in range(-1, 2):
-            if (i != 0 and j != 0):
+            if (i != 0 or j != 0):
                 if 0 <= row_index + i < max_height and 0 <= col_index + j < max_width:
                     neighborhood_list.append((row_index + i, col_index + j))
     return np.array(neighborhood_list)
 
 
 def update_mask(mincut_sets, mask):
-    # TODO findout how the cutsets looks like
-    height, width = mask.shape[:2]
-    for row in height:
-        for col in width:
-            pass
-            mask[row][col] = 0 if mincut_sets[0] else 3
-    return mask
+    height, width = mask.shape
+    flat_mask = mask.flatten()
+    # 0 stays 0 3 can be 3 or 2, 2 can be 2 or 3
+    # cut[0] source BG , cut[1] sink FG.
+
+    # Create a boolean mask for the indexes in mincut_sets[0]
+    source_mask = np.isin(np.arange(flat_mask.size), mincut_sets[0])
+
+    # Update the mask based on the conditions
+    flat_mask[(source_mask) & (flat_mask == 3)] = 2
+    flat_mask[(~source_mask) & (flat_mask == 2)] = 3
+
+    # Reshape the flattened mask back to the original shape
+    updated_mask = flat_mask.reshape(height, width)
+    return updated_mask
+
 
 
 def check_convergence(energy):
     # TODO: implement convergence check
     convergence = False
-    return convergence
+    return True
 
 
 def cal_metric(predicted_mask, gt_mask):
