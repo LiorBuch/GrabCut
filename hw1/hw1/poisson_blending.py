@@ -8,6 +8,7 @@ import argparse
 
 def poisson_blend(im_src, im_tgt, im_mask, center):
     # LAPLACIAN OPERATOR
+
     r_channel = im_src[:, :, 0]
     g_channel = im_src[:, :, 1]
     b_channel = im_src[:, :, 2]
