@@ -39,6 +39,12 @@ def grabcut(img, rect, n_iter=5):
         mask = update_mask(mincut_sets, mask)
 
         if check_convergence(energy):
+            height, width = mask.shape
+            flat_mask = mask.flatten()
+            flat_mask[(flat_mask == GC_PR_FGD)] = 1
+            flat_mask[(flat_mask == GC_PR_BGD)] = 0
+
+            mask = flat_mask.reshape(height, width)
             break
 
     # Return the final mask and the GMMs
@@ -49,10 +55,10 @@ def initalize_GMMs(img, mask):
     # TODO: implement initalize_GMMs
     bgGMM = GaussianMixture(n_components=5, random_state=0)
     fgGMM = GaussianMixture(n_components=5, random_state=0)
-    # bgGMM.fit(img.reshape(-1, 3))
-    # fgGMM.fit(mask.reshape(-1, 3))
-    background_pixels = img[mask == 0]
-    foreground_pixels = img[mask == 3]
+    bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
+    background_pixels = img[bgd_mask]
+    fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
+    foreground_pixels = img[fg_mask]
     bgGMM.fit(background_pixels)
     fgGMM.fit(foreground_pixels)
     return bgGMM, fgGMM
@@ -60,9 +66,10 @@ def initalize_GMMs(img, mask):
 
 # Define helper functions for the GrabCut algorithm
 def update_GMMs(img, mask, bgGMM, fgGMM):
-    # TODO: implement GMM component assignment step
-    background_pixels = img[mask <= 2]
-    foreground_pixels = img[mask == 3]
+    bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
+    background_pixels = img[bgd_mask]
+    fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
+    foreground_pixels = img[fg_mask]
     bgGMM.fit(background_pixels)
     fgGMM.fit(foreground_pixels)
     return bgGMM, fgGMM
@@ -154,14 +161,12 @@ def update_mask(mincut_sets, mask):
     source_mask = np.isin(np.arange(flat_mask.size), mincut_sets[0])
 
     # Update the mask based on the conditions
-    flat_mask[(source_mask) & (flat_mask == 3)] = 2
-    flat_mask[(~source_mask) & (flat_mask == 2)] = 3
+    flat_mask[(source_mask) & (flat_mask == GC_PR_FGD)] = GC_PR_BGD
+    flat_mask[(~source_mask) & (flat_mask == GC_PR_BGD)] = GC_PR_FGD
 
     # Reshape the flattened mask back to the original shape
     updated_mask = flat_mask.reshape(height, width)
     return updated_mask
-
-
 
 def check_convergence(energy):
     # TODO: implement convergence check
@@ -172,12 +177,15 @@ def check_convergence(energy):
 def cal_metric(predicted_mask, gt_mask):
     # TODO: implement metric calculation
 
-    return 100, 100
+    intersection = np.sum((predicted_mask == 1) & (gt_mask == 1))
+    union = np.sum((predicted_mask == 1) | (gt_mask == 1))
+    jaccard = intersection/union
+    return accuracy, jaccard
 
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='banana1', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='teddy', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
