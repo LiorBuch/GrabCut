@@ -1,3 +1,5 @@
+import math
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,8 +17,8 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
     num_pixels_to_paste = im_mask.shape[0]*im_mask.shape[1]
     src_center = int(im_src.shape[0] / 2) , int(im_src.shape[1] / 2)
 
-    relative_x = center[0] - src_center[0]
-    relative_y = center[1] - src_center[1]
+    relative_h = center[0] - src_center[0]
+    relative_w = center[1] - src_center[1]
 
     # We build A according to the formulas in rec3
     A = [lil_matrix((num_pixels_to_paste, num_pixels_to_paste), dtype='float64') for i in range(im_tgt.shape[2])]
@@ -27,19 +29,28 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
         for i in range(mask_height):
             print(f"row number {i} out of {mask_height}")
             for j in range(mask_width):
+                idx = i * mask_width + j
                 if im_mask[i, j] >= 100:
-                    if i == j:
-                        A[color][i, j] = 4
+                    A[color][i*mask_width+j,i*mask_width+j] = 4
                     for k, m in [(-1, 0), (0, -1), (1, 0), (0, 1)]:
-                        if 0 < i + k < mask_height and 0 < j + m < mask_width:
+                        ni, nj = i + k, j + m
+                        if 0 <= ni < mask_height and 0 <= nj < mask_width:
                             if im_mask[i + k, j + m] >= 100:
-                                A[color][i + k, j + m] = -1
+                                n_idx = ni * mask_width + nj
+                                A[color][n_idx,n_idx] = -1
+                                b[color][idx] += im_src[i,j, color]/3
                             else:  # If on the edge of the mask
                                 # TODO: Check that not out of bound in im_tgt
-                                b[color][(i + k) * mask_width + (j + m)] += im_tgt[relative_x + i + k, relative_y + j + m, color]
+                                b[color][idx] += im_tgt[relative_h + ni, relative_w + nj, color]
+                else:
+                    A[color][i * mask_width + j, i * mask_width + j] = 1
+                    try:
+                        b[color][idx] = im_tgt[relative_h+i,relative_w + j,color]
+                    except:
+                        b[color][idx] = 10
 
         # POISSON SOLVE
-        f.append(spsolve(A[color], b[color]))
+        f.append(spsolve(A[color].tocsc(), b[color]))
 
     # BLEND
     # boundary = get_boundary(im_mask)
@@ -48,7 +59,7 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
             for j in range(im_src.shape[1]):
                 if im_mask[i, j] >= 100:
                     print(f"Pasting {i}, {j} -> {f[color][i * mask_width + j]}")
-                    im_tgt[relative_x+i,relative_y+j,color] = f[color][i * mask_width + j]
+                    im_tgt[relative_h+i,relative_w+j,color] = np.abs(f[color][i * mask_width + j])
 
     # SAVE
 
