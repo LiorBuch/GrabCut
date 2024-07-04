@@ -91,28 +91,25 @@ def initalize_GMMs(img, mask):
     bgGMM.covariances_ = np.array([np.cov(background_pixels[bg_kmeans.labels_ == i].T) for i in range(clusters_number)])
     fgGMM.covariances_ = np.array([np.cov(foreground_pixels[fg_kmeans.labels_ == i].T) for i in range(clusters_number)])
 
-    # Ensure covariances are positive definite
-    #reg_cov = 1e-6 * np.eye(bgGMM.covariances_.shape[1])
-    #bgGMM.covariances_ += reg_cov
-    #fgGMM.covariances_ += reg_cov
-
-    # Initialize the precisions
-    bgGMM.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(bgGMM.covariances_))
-    fgGMM.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(fgGMM.covariances_))
     return bgGMM, fgGMM
 
 
 def calc_N(xi, mu, sigma):
     xi_minus_mu = np.array(xi) - np.array(mu)
-    sigma_inverse = np.linalg.inv(sigma)  # TODO: make sure there is a inverse..
+    try:
+        sigma_inverse = np.linalg.inv(sigma)
+    except np.linalg.LinAlgError:
+        reg_cov = 1e-6 * np.eye(len(sigma))
+        sigma += reg_cov
+        sigma_inverse = np.linalg.inv(sigma)
+
     sigma_determinant = np.linalg.det(sigma)
     xi_dimension = len(xi)
-    numerator = np.e ** (-0.5 * np.dot(np.dot(xi_minus_mu.T, sigma_inverse), xi_minus_mu))
+    numerator = np.exp(-0.5 * np.dot(np.dot(xi_minus_mu.T, sigma_inverse), xi_minus_mu))
     denominator = ((2 * np.pi) ** (xi_dimension / 2)) * (sigma_determinant ** 0.5)
     return numerator / denominator
 
 
-# ric
 def evaluate_responsibility_for_pixel(pixel: list, gmm: GaussianMixture):
     probability = []
     for cluster_index in range(gmm.n_components):
@@ -122,18 +119,20 @@ def evaluate_responsibility_for_pixel(pixel: list, gmm: GaussianMixture):
         N = calc_N(pixel, mu, sigma)
         numerator = weight * N
         probability.append(numerator)
-    # Normalize
     denominator = sum(probability)
+    if denominator == 0:
+        return [0] * gmm.n_components
     probability = [pro / denominator for pro in probability]
     return probability
 
 
 def re_estimate_gmms_parameters(responsibility, pixels, cluster_index):
     sum_ric = np.sum(responsibility[:, cluster_index])
+    if sum_ric == 0:
+        return 0, np.zeros(pixels.shape[1]), np.eye(pixels.shape[1])
+
     mu = np.sum(pixels * responsibility[:, cluster_index].reshape(-1, 1), axis=0) / sum_ric
-
     weight = sum_ric / len(pixels)
-
     diff = pixels - mu
     sigma = np.dot((responsibility[:, cluster_index].reshape(-1, 1) * diff).T, diff) / sum_ric
 
@@ -141,11 +140,8 @@ def re_estimate_gmms_parameters(responsibility, pixels, cluster_index):
 
 
 def update_gmm(gmm: GaussianMixture, pixels):
-    responsibilities = []
-    for pixel in pixels:
-        responsibilities.append(evaluate_responsibility_for_pixel(pixel, gmm))
+    responsibilities = np.array([evaluate_responsibility_for_pixel(pixel, gmm) for pixel in pixels])
 
-    responsibilities = np.array(responsibilities)
     weights = []
     mus = []
     sigmas = []
@@ -159,15 +155,11 @@ def update_gmm(gmm: GaussianMixture, pixels):
     gmm.means_ = np.array(mus)
     gmm.covariances_ = np.array(sigmas)
 
-    # Again, ensure covariance are PD
-    try:
-        gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(gmm.covariances_))
-    except np.linalg.LinAlgError:
-        reg_cov = 1e-6 * np.eye(gmm.covariances_.shape[1])
-        gmm.covariances_ += reg_cov
-        gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(gmm.covariances_))
-    return gmm
+    # Ensure covariances are positive definite
+    reg_cov = 1e-6 * np.eye(pixels.shape[1])
+    gmm.covariances_ += reg_cov
 
+    return gmm
 
 # Define helper functions for the GrabCut algorithm
 def update_GMMs(img, mask, bgGMM, fgGMM):
@@ -182,8 +174,43 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     return bgGMM, fgGMM
 
 
-def maximum_likelihood():
-    pass
+def maximum_likelihood(gmm: GaussianMixture, img):
+    likelihoods = []
+    for row in img:
+        current_row = []
+        for pixel in row:
+            pixel_probability = 0
+            for cluster_index in range(gmm.n_components):
+                weight = gmm.weights_[cluster_index]
+                cov = gmm.covariances_[cluster_index]
+
+                # Regularize the covariance matrix if needed
+                if np.linalg.det(cov) == 0:
+                    reg_cov = 1e-6 * np.eye(len(cov))
+                    cov += reg_cov
+
+                det = np.linalg.det(cov)
+                if det <= 0:
+                    continue  # Skip this component if covariance is singular
+
+                sigma_inverse = np.linalg.inv(cov)
+                x_minus_u = pixel - gmm.means_[cluster_index]
+
+                # Calculate exponent part more stably
+                exponent = -0.5 * np.dot(np.dot(x_minus_u, sigma_inverse), x_minus_u)
+
+                # Calculate probability density for the current component
+                prob_density = (weight / ((2 * np.pi) ** (len(pixel) / 2) * np.sqrt(det))) * np.exp(exponent)
+
+                pixel_probability += prob_density
+
+            # Avoid log(0) by ensuring pixel_probability is positive
+            if pixel_probability <= 0:
+                pixel_probability = 1e-10
+
+            current_row.append(-np.log(pixel_probability))
+        likelihoods.append(current_row)
+    return np.array(likelihoods)
 
 
 def calculate_mincut(img, mask, bgGMM, fgGMM):
@@ -227,8 +254,10 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
                 K = max(K, sum_n)
         print(f"K={K}")
 
-    fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
-    bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    # fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    # bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    fg_img_prob = maximum_likelihood(fgGMM, img)
+    bg_img_prob = maximum_likelihood(bgGMM, img)
 
     src_weights = []  #
     sink_weights = []  #
@@ -315,7 +344,7 @@ def cal_metric(predicted_mask, gt_mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='fullmoon', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='cross', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
