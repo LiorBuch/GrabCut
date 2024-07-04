@@ -5,6 +5,7 @@ import cv2
 import igraph as ig
 import argparse
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 
 GC_BGD = 0  # Hard bg pixel
 GC_FGD = 1  # Hard fg pixel, will not be used
@@ -50,6 +51,7 @@ def grabcut(img, rect, n_iter=5):
         mask = update_mask(mincut_sets, mask)
 
         if check_convergence(energy):
+            # Since we finished the iterations - time to update the mask to be 0-1
             height, width = mask.shape
             flat_mask = mask.flatten()
             flat_mask[(flat_mask == GC_PR_FGD)] = 1
@@ -63,15 +65,108 @@ def grabcut(img, rect, n_iter=5):
 
 
 def initalize_GMMs(img, mask):
-    bgGMM = GaussianMixture(n_components=5, random_state=0)
-    fgGMM = GaussianMixture(n_components=5, random_state=0)
     bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
-    bgGMM.fit(background_pixels)
-    fgGMM.fit(foreground_pixels)
+
+    clusters_number = 5
+    # Apply KMeans clustering
+    bg_kmeans = KMeans(n_clusters=clusters_number, random_state=0).fit(background_pixels)
+    fg_kmeans = KMeans(n_clusters=clusters_number, random_state=0).fit(foreground_pixels)
+
+    # Initialize GMMs using KMeans clusters
+    bgGMM = GaussianMixture(n_components=clusters_number, covariance_type='full')
+    fgGMM = GaussianMixture(n_components=clusters_number, covariance_type='full')
+
+    # Manually set GMM parameters from KMeans
+    bgGMM.means_ = bg_kmeans.cluster_centers_
+    fgGMM.means_ = fg_kmeans.cluster_centers_
+
+    # Assign weights based on the number of points in each cluster
+    bgGMM.weights_ = np.bincount(bg_kmeans.labels_) / len(bg_kmeans.labels_)
+    fgGMM.weights_ = np.bincount(fg_kmeans.labels_) / len(fg_kmeans.labels_)
+
+    # Compute covariances
+    bgGMM.covariances_ = np.array([np.cov(background_pixels[bg_kmeans.labels_ == i].T) for i in range(clusters_number)])
+    fgGMM.covariances_ = np.array([np.cov(foreground_pixels[fg_kmeans.labels_ == i].T) for i in range(clusters_number)])
+
+    # Ensure covariances are positive definite
+    #reg_cov = 1e-6 * np.eye(bgGMM.covariances_.shape[1])
+    #bgGMM.covariances_ += reg_cov
+    #fgGMM.covariances_ += reg_cov
+
+    # Initialize the precisions
+    bgGMM.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(bgGMM.covariances_))
+    fgGMM.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(fgGMM.covariances_))
     return bgGMM, fgGMM
+
+
+def calc_N(xi, mu, sigma):
+    xi_minus_mu = np.array(xi) - np.array(mu)
+    sigma_inverse = np.linalg.inv(sigma)  # TODO: make sure there is a inverse..
+    sigma_determinant = np.linalg.det(sigma)
+    xi_dimension = len(xi)
+    numerator = np.e ** (-0.5 * np.dot(np.dot(xi_minus_mu.T, sigma_inverse), xi_minus_mu))
+    denominator = ((2 * np.pi) ** (xi_dimension / 2)) * (sigma_determinant ** 0.5)
+    return numerator / denominator
+
+
+# ric
+def evaluate_responsibility_for_pixel(pixel: list, gmm: GaussianMixture):
+    probability = []
+    for cluster_index in range(gmm.n_components):
+        weight = gmm.weights_[cluster_index]
+        mu = gmm.means_[cluster_index]
+        sigma = gmm.covariances_[cluster_index]
+        N = calc_N(pixel, mu, sigma)
+        numerator = weight * N
+        probability.append(numerator)
+    # Normalize
+    denominator = sum(probability)
+    probability = [pro / denominator for pro in probability]
+    return probability
+
+
+def re_estimate_gmms_parameters(responsibility, pixels, cluster_index):
+    sum_ric = np.sum(responsibility[:, cluster_index])
+    mu = np.sum(pixels * responsibility[:, cluster_index].reshape(-1, 1), axis=0) / sum_ric
+
+    weight = sum_ric / len(pixels)
+
+    diff = pixels - mu
+    sigma = np.dot((responsibility[:, cluster_index].reshape(-1, 1) * diff).T, diff) / sum_ric
+
+    return weight, mu, sigma
+
+
+def update_gmm(gmm: GaussianMixture, pixels):
+    responsibilities = []
+    for pixel in pixels:
+        responsibilities.append(evaluate_responsibility_for_pixel(pixel, gmm))
+
+    responsibilities = np.array(responsibilities)
+    weights = []
+    mus = []
+    sigmas = []
+    for cluster_index in range(gmm.n_components):
+        weight, mu, sigma = re_estimate_gmms_parameters(responsibilities, pixels, cluster_index)
+        weights.append(weight)
+        mus.append(mu)
+        sigmas.append(sigma)
+
+    gmm.weights_ = np.array(weights)
+    gmm.means_ = np.array(mus)
+    gmm.covariances_ = np.array(sigmas)
+
+    # Again, ensure covariance are PD
+    try:
+        gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(gmm.covariances_))
+    except np.linalg.LinAlgError:
+        reg_cov = 1e-6 * np.eye(gmm.covariances_.shape[1])
+        gmm.covariances_ += reg_cov
+        gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(gmm.covariances_))
+    return gmm
 
 
 # Define helper functions for the GrabCut algorithm
@@ -80,9 +175,15 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
-    bgGMM.fit(background_pixels)
-    fgGMM.fit(foreground_pixels)
+
+    bgGMM = update_gmm(bgGMM, background_pixels)
+    fgGMM = update_gmm(fgGMM, foreground_pixels)
+
     return bgGMM, fgGMM
+
+
+def maximum_likelihood():
+    pass
 
 
 def calculate_mincut(img, mask, bgGMM, fgGMM):
@@ -196,7 +297,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.0001 or LOOP_TRACK == 20  # TODO: Update this value
+    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.001 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
@@ -208,13 +309,13 @@ def cal_metric(predicted_mask, gt_mask):
 
     intersection = np.sum((predicted_mask == 1) & (gt_mask == 1))
     union = np.sum((predicted_mask == 1) | (gt_mask == 1))
-    jaccard = intersection/union
+    jaccard = intersection / union
     return accuracy, jaccard
 
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='banana1', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='fullmoon', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
