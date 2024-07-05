@@ -63,8 +63,8 @@ def grabcut(img, rect, n_iter=5):
 
 
 def initalize_GMMs(img, mask):
-    bgGMM = GaussianMixture(n_components=5, random_state=0)
-    fgGMM = GaussianMixture(n_components=5, random_state=0)
+    bgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
+    fgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
     bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
@@ -80,12 +80,15 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
+
+    #newBgGMM = GaussianMixture(n_components=5,random_state=0,means_init=bgGMM.means_,weights_init=bgGMM.weights_,reg_covar=bgGMM.covariances_,)
+    #newFgGMM = GaussianMixture(n_components=5,random_state=0,means_init=fgGMM.means_,weights_init=fgGMM.weights_,reg_covar=fgGMM.covariances_)
     bgGMM.fit(background_pixels)
     fgGMM.fit(foreground_pixels)
     return bgGMM, fgGMM
 
 
-def calculate_mincut(img, mask, bgGMM, fgGMM):
+def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture):
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
     t1 = time.time()
@@ -102,6 +105,7 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
         SRC_EDGES = [(source_index, i) for i in range(num_of_pixels)]
         SINK_EDGES = [(i, sink_index) for i in range(num_of_pixels)]
         print("calc beta")
+        BETA = 0
         for row in range(height):
             for col in range(width):
                 nei_list = neighborhood(row, col, width, height)
@@ -129,14 +133,17 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
     fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
     bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
 
-    src_weights = []  #
-    sink_weights = []  #
+    src_weights = []  # fg
+    sink_weights = []  # bg
 
     for row_index in range(0, height):
         for col_index in range(0, width):
             if mask[row_index][col_index] == GC_BGD:
-                src_weights.append(K)  # if we know its bg, the wight should be K
+                src_weights.append(K)  # if we know its bg, the weight should be K
                 sink_weights.append(0)
+            elif mask[row_index][col_index] == GC_FGD:
+                src_weights.append(0)
+                sink_weights.append(K)  # if we know its fg, the weight should be K
             else:  # If the mask is 2 or 3, use the prob
                 sink_weights.append(bg_img_prob[row_index][col_index])
                 src_weights.append(fg_img_prob[row_index][col_index])
@@ -196,7 +203,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.0001 or LOOP_TRACK == 20  # TODO: Update this value
+    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.001 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
