@@ -254,8 +254,8 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
                 fg_weights.append(K)  # if we know its fg, the weight should be K
             else:  # If the mask is 2 or 3, use the prob
                 # TODO: Check if should be bg-fg instead
-                bg_weights.append(bg_img_prob[row_index][col_index])
-                fg_weights.append(fg_img_prob[row_index][col_index])
+                bg_weights.append(fg_img_prob[row_index][col_index])
+                fg_weights.append(bg_img_prob[row_index][col_index])
 
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
