@@ -4,7 +4,10 @@ import numpy as np
 import cv2
 import igraph as ig
 import argparse
+
+import scipy
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 
 GC_BGD = 0  # Hard bg pixel
 GC_FGD = 1  # Hard fg pixel, will not be used
@@ -23,6 +26,107 @@ SRC_EDGES = []
 SINK_EDGES = []
 
 
+class Gaussian:
+    def __init__(self, comp_num: int, pixels):
+        self.comp_num = comp_num
+        kmeans_clusters = KMeans(n_clusters=self.comp_num, n_init=1).fit(pixels)
+        self.means = kmeans_clusters.cluster_centers_
+        self.weights = np.array([np.sum(kmeans_clusters.labels_ == i) / len(pixels) for i in range(comp_num)])
+        self.covariance = np.array([np.cov(pixels[kmeans_clusters.labels_ == i].T) for i in range(comp_num)])
+        for i in range(comp_num):
+            if np.linalg.det(self.covariance[i]) == 0:
+                reg_cov = 1e-6 * np.eye(len(self.covariance[i]))
+                self.covariance[i] += reg_cov
+        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in range(comp_num)])
+        self.covariance_det = np.array([np.linalg.det(self.covariance[i]) for i in range(comp_num)])
+
+    def calc_N(self, xi, mu, covariance_inverse, covariance_determinant):
+        xi_minus_mu = np.array(xi) - np.array(mu)
+        xi_dimension = len(xi)
+        numerator = np.e ** (-0.5 * np.dot(np.dot(xi_minus_mu.T, covariance_inverse), xi_minus_mu))
+        denominator = ((2 * np.pi) ** (xi_dimension / 2)) * (covariance_determinant ** 0.5)
+        return numerator / denominator
+
+    # ric
+    def evaluate_responsibility_for_pixel(self, pixel: list):
+        probability = np.zeros(self.comp_num)
+        for cluster_index in range(self.comp_num):
+            covariance_inverse = self.covariance_inverse[cluster_index]
+            covariance_determinant = self.covariance_det[cluster_index]
+            N = self.calc_N(pixel, self.means[cluster_index], covariance_inverse, covariance_determinant)
+            weight = self.weights[cluster_index]
+            numerator = weight * N
+            probability[cluster_index] = numerator
+        # Normalize
+        return np.array(probability) / sum(probability)
+
+    def re_estimate_gmms_parameters(self, responsibility, pixels, cluster_index):
+        sum_ric = np.sum(responsibility[:, cluster_index])
+        mu = np.sum(pixels * responsibility[:, cluster_index].reshape(-1, 1), axis=0) / sum_ric
+
+        weight = sum_ric / len(pixels)
+
+        diff = pixels - mu
+        sigma = np.dot((responsibility[:, cluster_index].reshape(-1, 1) * diff).T, diff) / sum_ric
+
+        return weight, mu, sigma
+
+    def fit(self, pixels):
+        responsibilities = np.zeros((pixels.shape[0],5))
+        for pixel_index in range(pixels.shape[0]):
+                responsibilities[pixel_index] = self.evaluate_responsibility_for_pixel(pixels[pixel_index])
+
+        responsibilities = np.array(responsibilities)
+        self.weights = np.zeros(self.comp_num)
+        self.means = np.zeros((self.comp_num, 3))
+        self.covariance = np.zeros((self.comp_num, 3, 3))
+        for cluster_index in range(self.comp_num):
+            weight, mu, sigma = self.re_estimate_gmms_parameters(responsibilities, pixels, cluster_index)
+            self.weights[cluster_index] = weight
+            self.means[cluster_index] = mu
+            self.covariance[cluster_index] = sigma
+
+        self.weights = np.array(self.weights)
+        self.means = np.array(self.means)
+        self.covariance = np.array(self.covariance)
+        for i in range(self.comp_num):
+            if np.linalg.det(self.covariance[i]) == 0:
+                reg_cov = 1e-6 * np.eye(len(self.covariance[i]))
+                self.covariance[i] += reg_cov
+        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in range(self.comp_num)])
+        self.covariance_det = np.array([np.linalg.det(self.covariance[i]) for i in range(self.comp_num)])
+
+
+    def score_samples(self, pixels):
+        likelihoods = []
+        for row in pixels:
+            current_row = []
+            for pixel in row:
+                pixel_probability = 0
+                for cluster_index in range(self.comp_num):
+                    if self.covariance_det[cluster_index] <= 0:
+                        continue  # Skip this component if covariance is singular
+
+                    x_minus_u = pixel - self.means[cluster_index]
+
+                    # Calculate exponent part more stably
+                    exponent = -0.5 * np.dot(np.dot(x_minus_u, self.covariance_inverse[cluster_index]), x_minus_u)
+
+                    # Calculate probability density for the current component
+                    prob_density = (self.weights[cluster_index] / ((2 * np.pi) ** (len(pixel) / 2) * np.sqrt(
+                        self.covariance_det[cluster_index]))) * np.exp(exponent)
+
+                    pixel_probability += prob_density
+
+                # Avoid log(0) by ensuring pixel_probability is positive
+                if pixel_probability <= 0:
+                    pixel_probability = 1e-10
+
+                current_row.append(-np.log(pixel_probability))
+            likelihoods.append(current_row)
+        return np.array(likelihoods)
+
+
 # Define the GrabCut algorithm function
 def grabcut(img, rect, n_iter=5):
     # Assign initial labels to the pixels based on the bounding box
@@ -38,7 +142,7 @@ def grabcut(img, rect, n_iter=5):
     mask[y:y + h, x:x + w] = GC_PR_FGD
     mask[rect[1] + rect[3] // 2, rect[0] + rect[2] // 2] = GC_FGD
 
-    bgGMM, fgGMM = initalize_GMMs(img, mask)
+    bgGMM, fgGMM = initalize_GMMs(img, mask, n_iter)
 
     num_iters = 1000
     for i in range(num_iters):
@@ -62,16 +166,21 @@ def grabcut(img, rect, n_iter=5):
     return mask, bgGMM, fgGMM
 
 
-def initalize_GMMs(img, mask):
-    bgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
-    fgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
+def initalize_GMMs(img, mask, n_components):
     bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
-    bgGMM.fit(background_pixels)
-    fgGMM.fit(foreground_pixels)
-    return bgGMM, fgGMM
+
+    # Create the Gaussian mixture objects
+    # bgGMM = GaussianMixture(n_components=n_components, random_state=0, warm_start=True)
+    # fgGMM = GaussianMixture(n_components=n_components, random_state=0, warm_start=True)
+
+    # bgGMM.fit(background_pixels)
+    # fgGMM.fit(foreground_pixels)
+
+    # return bgGMM, fgGMM
+    return Gaussian(5, background_pixels), Gaussian(5, foreground_pixels)
 
 
 # Define helper functions for the GrabCut algorithm
@@ -81,14 +190,13 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
 
-    #newBgGMM = GaussianMixture(n_components=5,random_state=0,means_init=bgGMM.means_,weights_init=bgGMM.weights_,reg_covar=bgGMM.covariances_,)
-    #newFgGMM = GaussianMixture(n_components=5,random_state=0,means_init=fgGMM.means_,weights_init=fgGMM.weights_,reg_covar=fgGMM.covariances_)
     bgGMM.fit(background_pixels)
     fgGMM.fit(foreground_pixels)
+
     return bgGMM, fgGMM
 
 
-def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture):
+def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
     t1 = time.time()
@@ -98,12 +206,12 @@ def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture
 
     g.add_vertices(num_of_pixels + 2)
     # Last 2 vertices are the source and the sink.
-    source_index = height * width  # bg
-    sink_index = source_index + 1  # fg
+    bg_index = height * width  # bg
+    fg_index = bg_index + 1  # fg
 
     if BETA == -1:
-        SRC_EDGES = [(source_index, i) for i in range(num_of_pixels)]
-        SINK_EDGES = [(i, sink_index) for i in range(num_of_pixels)]
+        SRC_EDGES = [(bg_index, i) for i in range(num_of_pixels)]
+        SINK_EDGES = [(i, fg_index) for i in range(num_of_pixels)]
         print("calc beta")
         BETA = 0
         for row in range(height):
@@ -130,29 +238,30 @@ def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture
                 K = max(K, sum_n)
         print(f"K={K}")
 
-    fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
-    bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    fg_img_prob = fgGMM.score_samples(img)#.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    bg_img_prob = bgGMM.score_samples(img)#.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
 
-    src_weights = []  # fg
-    sink_weights = []  # bg
+    bg_weights = []  # bg
+    fg_weights = []  # fg
 
     for row_index in range(0, height):
         for col_index in range(0, width):
             if mask[row_index][col_index] == GC_BGD:
-                src_weights.append(K)  # if we know its bg, the weight should be K
-                sink_weights.append(0)
+                bg_weights.append(K)  # if we know its bg, the weight should be K
+                fg_weights.append(0)
             elif mask[row_index][col_index] == GC_FGD:
-                src_weights.append(0)
-                sink_weights.append(K)  # if we know its fg, the weight should be K
+                bg_weights.append(0)
+                fg_weights.append(K)  # if we know its fg, the weight should be K
             else:  # If the mask is 2 or 3, use the prob
-                sink_weights.append(bg_img_prob[row_index][col_index])
-                src_weights.append(fg_img_prob[row_index][col_index])
+                # TODO: Check if should be bg-fg instead
+                bg_weights.append(bg_img_prob[row_index][col_index])
+                fg_weights.append(fg_img_prob[row_index][col_index])
 
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
     g.add_edges(BETWEEN_EDGES)
-    g.es['weight'] = np.concatenate([src_weights, sink_weights, BETWEEN_WEIGHTS])
-    min_cut = g.mincut(source=source_index, target=sink_index, capacity='weight')
+    g.es['weight'] = np.concatenate([bg_weights, fg_weights, BETWEEN_WEIGHTS])
+    min_cut = g.mincut(source=bg_index, target=fg_index, capacity='weight')
     min_cut_part = min_cut.partition  # [[], []]
     energy = min_cut.value
     print(f"min cut runtime -> {time.time() - t1}")
@@ -203,7 +312,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.001 or LOOP_TRACK == 20  # TODO: Update this value
+    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.01 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
@@ -215,7 +324,7 @@ def cal_metric(predicted_mask, gt_mask):
 
     intersection = np.sum((predicted_mask == 1) & (gt_mask == 1))
     union = np.sum((predicted_mask == 1) | (gt_mask == 1))
-    jaccard = intersection/union
+    jaccard = intersection / union
     return accuracy, jaccard
 
 
