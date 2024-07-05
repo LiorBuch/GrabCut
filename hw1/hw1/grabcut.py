@@ -4,7 +4,10 @@ import numpy as np
 import cv2
 import igraph as ig
 import argparse
-from sklearn.mixture import GaussianMixture
+
+from sklearn.cluster import KMeans
+
+from mix import GaussianMixture
 
 GC_BGD = 0  # Hard bg pixel
 GC_FGD = 1  # Hard fg pixel, will not be used
@@ -63,14 +66,12 @@ def grabcut(img, rect, n_iter=5):
 
 
 def initalize_GMMs(img, mask):
-    bgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
-    fgGMM = GaussianMixture(n_components=5, random_state=0,warm_start=True)
     bgd_mask = (mask == GC_BGD) | (mask == GC_PR_BGD)
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
-    bgGMM.fit(background_pixels)
-    fgGMM.fit(foreground_pixels)
+    bgGMM = GaussianMixture(n_components=5, X=background_pixels.reshape((-1, img.shape[-1])))
+    fgGMM = GaussianMixture(n_components=5, X=foreground_pixels.reshape((-1, img.shape[-1])))
     return bgGMM, fgGMM
 
 
@@ -81,14 +82,15 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
 
-    #newBgGMM = GaussianMixture(n_components=5,random_state=0,means_init=bgGMM.means_,weights_init=bgGMM.weights_,reg_covar=bgGMM.covariances_,)
-    #newFgGMM = GaussianMixture(n_components=5,random_state=0,means_init=fgGMM.means_,weights_init=fgGMM.weights_,reg_covar=fgGMM.covariances_)
-    bgGMM.fit(background_pixels)
-    fgGMM.fit(foreground_pixels)
+    bg_label = KMeans(n_clusters=bgGMM.n_components, n_init=1).fit(background_pixels.reshape((-1, img.shape[-1]))).labels_
+    fg_label = KMeans(n_clusters=fgGMM.n_components, n_init=1).fit(foreground_pixels.reshape((-1, img.shape[-1]))).labels_
+
+    bgGMM.fit(background_pixels.reshape((-1, img.shape[-1])),labels=bg_label)
+    fgGMM.fit(foreground_pixels.reshape((-1, img.shape[-1])),labels=fg_label)
     return bgGMM, fgGMM
 
 
-def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture):
+def calculate_mincut(img, mask, bgGMM: GaussianMixture, fgGMM: GaussianMixture):
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
     t1 = time.time()
@@ -130,24 +132,28 @@ def calculate_mincut(img, mask, bgGMM : GaussianMixture, fgGMM : GaussianMixture
                 K = max(K, sum_n)
         print(f"K={K}")
 
-    fg_img_prob = - fgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
-    bg_img_prob = - bgGMM.score_samples(img.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
+    # Reshape image and calculate probabilities
+    img_reshaped = img.reshape((-1, img.shape[-1]))
+    fg_img_prob = fgGMM.calc_prob(img_reshaped).reshape(img.shape[:-1])
+    bg_img_prob = bgGMM.calc_prob(img_reshaped).reshape(img.shape[:-1])
 
-    src_weights = []  # fg
-    sink_weights = []  # bg
+    ts = time.time()
+    # Initialize weights with zeros
+    src_weights = np.zeros((height, width))
+    sink_weights = np.zeros((height, width))
 
-    for row_index in range(0, height):
-        for col_index in range(0, width):
-            if mask[row_index][col_index] == GC_BGD:
-                src_weights.append(K)  # if we know its bg, the weight should be K
-                sink_weights.append(0)
-            elif mask[row_index][col_index] == GC_FGD:
-                src_weights.append(0)
-                sink_weights.append(K)  # if we know its fg, the weight should be K
-            else:  # If the mask is 2 or 3, use the prob
-                sink_weights.append(bg_img_prob[row_index][col_index])
-                src_weights.append(fg_img_prob[row_index][col_index])
+    # Use boolean indexing to set weights based on the mask
+    src_weights[mask == GC_BGD] = K
+    sink_weights[mask == GC_FGD] = K
 
+    # For the rest of the pixels, use the probabilities
+    mask_other = (mask != GC_BGD) & (mask != GC_FGD)
+    src_weights[mask_other] = bg_img_prob[mask_other]
+    sink_weights[mask_other] = fg_img_prob[mask_other]
+
+    # Flatten the weights to match the original list structure
+    src_weights = src_weights.flatten().tolist()
+    sink_weights = sink_weights.flatten().tolist()
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
     g.add_edges(BETWEEN_EDGES)
@@ -203,7 +209,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.001 or LOOP_TRACK == 20  # TODO: Update this value
+    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.01 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
@@ -215,13 +221,13 @@ def cal_metric(predicted_mask, gt_mask):
 
     intersection = np.sum((predicted_mask == 1) & (gt_mask == 1))
     union = np.sum((predicted_mask == 1) | (gt_mask == 1))
-    jaccard = intersection/union
+    jaccard = intersection / union
     return accuracy, jaccard
 
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='banana1', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='cross', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
