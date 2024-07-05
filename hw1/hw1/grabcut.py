@@ -82,32 +82,12 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
 
-    bgGMM.update(background_pixels.reshape((-1, img.shape[-1])))
-    fgGMM.update(foreground_pixels.reshape((-1, img.shape[-1])))
+    bgGMM.update(background_pixels)
+    fgGMM.update(foreground_pixels)
     return bgGMM, fgGMM
 
 
 def calculate_mincut(img, mask, bgGMM: GaussianMixture, fgGMM: GaussianMixture):
-    def calc_beta_smoothness():
-        _left_diff = img[:, 1:] - img[:, :-1]
-        _upleft_diff = img[1:, 1:] - img[:-1, :-1]
-        _up_diff = img[1:, :] - img[:-1, :]
-        _upright_diff = img[1:, :-1] - img[:-1, 1:]
-
-        beta = np.sum(np.square(_left_diff)) + np.sum(np.square(_upleft_diff)) + \
-               np.sum(np.square(_up_diff)) + \
-               np.sum(np.square(_upright_diff))
-        beta = 1 / (2 * beta / (
-            # Each pixel has 4 neighbors (left, upleft, up, upright)
-                4 * img.shape[1] * img.shape[0]
-                # The 1st column doesn't have left, upleft and the last column doesn't have upright
-                - 3 * img.shape[1]
-                - 3 * img.shape[0]  # The first row doesn't have upleft, up and upright
-                + 2))  # The first and last pixels in the 1st row are removed twice
-        print('Beta:', beta)
-    calc_beta_smoothness()
-
-
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
     t1 = time.time()
@@ -154,27 +134,27 @@ def calculate_mincut(img, mask, bgGMM: GaussianMixture, fgGMM: GaussianMixture):
     fg_img_prob = fgGMM.calc_prob(img_reshaped).reshape(img.shape[:-1])
     bg_img_prob = bgGMM.calc_prob(img_reshaped).reshape(img.shape[:-1])
 
-    ts = time.time()
+
     # Initialize weights with zeros
-    src_weights = np.zeros((height, width))
-    sink_weights = np.zeros((height, width))
+    bg_weights = np.zeros((height, width))  # bg
+    fg_weights = np.zeros((height, width))  # fg
 
     # Use boolean indexing to set weights based on the mask
-    src_weights[mask == GC_BGD] = K
-    sink_weights[mask == GC_FGD] = K
+    bg_weights[mask == GC_BGD] = K
+    fg_weights[mask == GC_FGD] = K
 
     # For the rest of the pixels, use the probabilities
     mask_other = (mask != GC_BGD) & (mask != GC_FGD)
-    src_weights[mask_other] = bg_img_prob[mask_other]
-    sink_weights[mask_other] = fg_img_prob[mask_other]
+    bg_weights[mask_other] = bg_img_prob[mask_other]
+    fg_weights[mask_other] = fg_img_prob[mask_other]
 
     # Flatten the weights to match the original list structure
-    src_weights = src_weights.flatten().tolist()
-    sink_weights = sink_weights.flatten().tolist()
+    bg_weights = bg_weights.flatten().tolist()
+    fg_weights = fg_weights.flatten().tolist()
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
     g.add_edges(BETWEEN_EDGES)
-    g.es['weight'] = np.concatenate([src_weights, sink_weights, BETWEEN_WEIGHTS])
+    g.es['weight'] = np.concatenate([bg_weights, fg_weights, BETWEEN_WEIGHTS])
     min_cut = g.mincut(source=source_index, target=sink_index, capacity='weight')
     min_cut_part = min_cut.partition  # [[], []]
     energy = min_cut.value
@@ -247,7 +227,7 @@ def cal_metric(predicted_mask, gt_mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='teddy', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='banana1', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
