@@ -1,5 +1,5 @@
 import time
-
+from numba import njit
 import numpy as np
 import cv2
 import igraph as ig
@@ -29,7 +29,7 @@ SINK_EDGES = []
 class Gaussian:
     def __init__(self, comp_num: int, pixels):
         self.comp_num = comp_num
-        kmeans_clusters = KMeans(n_clusters=self.comp_num, n_init=1).fit(pixels)
+        kmeans_clusters = KMeans(n_clusters=self.comp_num, n_init=10).fit(pixels)
         self.means = kmeans_clusters.cluster_centers_
         self.weights = np.array([np.sum(kmeans_clusters.labels_ == i) / len(pixels) for i in range(comp_num)])
         self.covariance = np.array([np.cov(pixels[kmeans_clusters.labels_ == i].T) for i in range(comp_num)])
@@ -59,7 +59,7 @@ class Gaussian:
             probability[cluster_index] = numerator
         # Normalize
         if sum(probability) == 0:
-            return 0
+            return np.ones(5)/5
         return np.array(probability) / sum(probability)
 
     def re_estimate_gmms_parameters(self, responsibility, pixels, cluster_index):
@@ -69,6 +69,7 @@ class Gaussian:
         weight = sum_ric / len(pixels)
 
         diff = pixels - mu
+        # TODO: check this
         sigma = np.dot((responsibility[:, cluster_index].reshape(-1, 1) * diff).T, diff) / sum_ric
 
         return weight, mu, sigma
@@ -78,7 +79,6 @@ class Gaussian:
         for pixel_index in range(pixels.shape[0]):
                 responsibilities[pixel_index] = self.evaluate_responsibility_for_pixel(pixels[pixel_index])
 
-        responsibilities = np.array(responsibilities)
         self.weights = np.zeros(self.comp_num)
         self.means = np.zeros((self.comp_num, 3))
         self.covariance = np.zeros((self.comp_num, 3, 3))
@@ -88,9 +88,6 @@ class Gaussian:
             self.means[cluster_index] = mu
             self.covariance[cluster_index] = sigma
 
-        self.weights = np.array(self.weights)
-        self.means = np.array(self.means)
-        self.covariance = np.array(self.covariance)
         for i in range(self.comp_num):
             if np.linalg.det(self.covariance[i]) == 0:
                 reg_cov = 1e-6 * np.eye(len(self.covariance[i]))
@@ -117,7 +114,8 @@ class Gaussian:
 
         # Avoid log(0) by ensuring pixel_probability is positive
         if pixel_probability <= 0:
-            return 0#pixel_probability = 1e-10
+            global K
+            return K
 
         return -np.log(pixel_probability)
 
@@ -182,7 +180,6 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
 
     return bgGMM, fgGMM
 
-
 def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
@@ -222,8 +219,10 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
                     N = (50 * np.exp(-1 * BETA * np.linalg.norm(img[row_index, col_index] - img[nei[0], nei[1]]) ** 2) *
                          (((row_index - nei[0]) ** 2 + (col_index - nei[1]) ** 2) ** -0.5))
                     sum_n += N
-                    BETWEEN_EDGES.append((pixel_index, nei[0] * width + nei[1]))
-                    BETWEEN_WEIGHTS.append(N)
+                    nei_index = nei[0] * width + nei[1]
+                    if pixel_index < nei_index:
+                        BETWEEN_EDGES.append((pixel_index, nei_index))
+                        BETWEEN_WEIGHTS.append(N)
                 K = max(K, sum_n)
         print(f"K={K}")
 
@@ -325,6 +324,7 @@ def parse():
 
 
 if __name__ == '__main__':
+
     # Load an example image and define a bounding box around the object of interest
     args = parse()
 
