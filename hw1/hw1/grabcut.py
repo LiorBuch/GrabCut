@@ -58,6 +58,8 @@ class Gaussian:
             numerator = weight * N
             probability[cluster_index] = numerator
         # Normalize
+        if sum(probability) == 0:
+            return 0
         return np.array(probability) / sum(probability)
 
     def re_estimate_gmms_parameters(self, responsibility, pixels, cluster_index):
@@ -96,35 +98,28 @@ class Gaussian:
         self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in range(self.comp_num)])
         self.covariance_det = np.array([np.linalg.det(self.covariance[i]) for i in range(self.comp_num)])
 
+    def score_sample(self, pixel):
+        pixel_probability = 0
+        for cluster_index in range(self.comp_num):
+            if self.covariance_det[cluster_index] <= 0:
+                continue  # Skip this component if covariance is singular
 
-    def score_samples(self, pixels):
-        likelihoods = []
-        for row in pixels:
-            current_row = []
-            for pixel in row:
-                pixel_probability = 0
-                for cluster_index in range(self.comp_num):
-                    if self.covariance_det[cluster_index] <= 0:
-                        continue  # Skip this component if covariance is singular
+            x_minus_u = pixel - self.means[cluster_index]
 
-                    x_minus_u = pixel - self.means[cluster_index]
+            # Calculate exponent part more stably
+            exponent = -0.5 * np.dot(np.dot(x_minus_u, self.covariance_inverse[cluster_index]), x_minus_u)
 
-                    # Calculate exponent part more stably
-                    exponent = -0.5 * np.dot(np.dot(x_minus_u, self.covariance_inverse[cluster_index]), x_minus_u)
+            # Calculate probability density for the current component
+            prob_density = (self.weights[cluster_index] / ((2 * np.pi) ** (len(pixel) / 2) * np.sqrt(
+                self.covariance_det[cluster_index]))) * np.exp(exponent)
 
-                    # Calculate probability density for the current component
-                    prob_density = (self.weights[cluster_index] / ((2 * np.pi) ** (len(pixel) / 2) * np.sqrt(
-                        self.covariance_det[cluster_index]))) * np.exp(exponent)
+            pixel_probability += prob_density
 
-                    pixel_probability += prob_density
+        # Avoid log(0) by ensuring pixel_probability is positive
+        if pixel_probability <= 0:
+            return 0#pixel_probability = 1e-10
 
-                # Avoid log(0) by ensuring pixel_probability is positive
-                if pixel_probability <= 0:
-                    pixel_probability = 1e-10
-
-                current_row.append(-np.log(pixel_probability))
-            likelihoods.append(current_row)
-        return np.array(likelihoods)
+        return -np.log(pixel_probability)
 
 
 # Define the GrabCut algorithm function
@@ -172,15 +167,7 @@ def initalize_GMMs(img, mask, n_components):
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
 
-    # Create the Gaussian mixture objects
-    # bgGMM = GaussianMixture(n_components=n_components, random_state=0, warm_start=True)
-    # fgGMM = GaussianMixture(n_components=n_components, random_state=0, warm_start=True)
-
-    # bgGMM.fit(background_pixels)
-    # fgGMM.fit(foreground_pixels)
-
-    # return bgGMM, fgGMM
-    return Gaussian(5, background_pixels), Gaussian(5, foreground_pixels)
+    return Gaussian(n_components, background_pixels), Gaussian(n_components, foreground_pixels)
 
 
 # Define helper functions for the GrabCut algorithm
@@ -214,14 +201,16 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
         SINK_EDGES = [(i, fg_index) for i in range(num_of_pixels)]
         print("calc beta")
         BETA = 0
+        squared_diff = []
         for row in range(height):
             for col in range(width):
                 nei_list = neighborhood(row, col, width, height)
-                sum_dist = 0
+                #sum_dist = 0
                 for nei in nei_list:
-                    sum_dist += np.linalg.norm(img[row, col] - img[nei[0], nei[1]])
-                BETA += sum_dist / len(nei_list)
-        BETA = BETA / num_of_pixels
+                    squared_diff.append(np.sum((img[row, col] - img[nei[0], nei[1]]) ** 2))
+                    #sum_dist += np.linalg.norm(img[row, col] - img[nei[0], nei[1]])
+                #BETA += sum_dist / len(nei_list)
+        BETA = 1/(2*np.mean(squared_diff))#BETA / num_of_pixels
         print(f"beta value -> {BETA}")
     if K == -1:
         for row_index in range(0, height):
@@ -238,9 +227,6 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
                 K = max(K, sum_n)
         print(f"K={K}")
 
-    fg_img_prob = fgGMM.score_samples(img)#.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
-    bg_img_prob = bgGMM.score_samples(img)#.reshape((-1, img.shape[-1]))).reshape(img.shape[:-1])
-
     bg_weights = []  # bg
     fg_weights = []  # fg
 
@@ -254,8 +240,8 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
                 fg_weights.append(K)  # if we know its fg, the weight should be K
             else:  # If the mask is 2 or 3, use the prob
                 # TODO: Check if should be bg-fg instead
-                bg_weights.append(fg_img_prob[row_index][col_index])
-                fg_weights.append(bg_img_prob[row_index][col_index])
+                bg_weights.append(fgGMM.score_sample(img[row_index][col_index]))
+                fg_weights.append(bgGMM.score_sample(img[row_index][col_index]))
 
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
@@ -312,7 +298,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.01 or LOOP_TRACK == 20  # TODO: Update this value
+    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.0001 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
@@ -330,7 +316,7 @@ def cal_metric(predicted_mask, gt_mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='banana1', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='cross', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
