@@ -70,8 +70,8 @@ def initalize_GMMs(img, mask):
     background_pixels = img[bgd_mask]
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
-    bgGMM = GaussianMixture(n_components=5, X=background_pixels.reshape((-1, img.shape[-1])))
-    fgGMM = GaussianMixture(n_components=5, X=foreground_pixels.reshape((-1, img.shape[-1])))
+    bgGMM = GaussianMixture(n_components=5, data=background_pixels)
+    fgGMM = GaussianMixture(n_components=5, data=foreground_pixels)
     return bgGMM, fgGMM
 
 
@@ -82,15 +82,32 @@ def update_GMMs(img, mask, bgGMM, fgGMM):
     fg_mask = (mask == GC_FGD) | (mask == GC_PR_FGD)
     foreground_pixels = img[fg_mask]
 
-    bg_label = KMeans(n_clusters=bgGMM.n_components, n_init=1).fit(background_pixels.reshape((-1, img.shape[-1]))).labels_
-    fg_label = KMeans(n_clusters=fgGMM.n_components, n_init=1).fit(foreground_pixels.reshape((-1, img.shape[-1]))).labels_
-
-    bgGMM.fit(background_pixels.reshape((-1, img.shape[-1])),labels=bg_label)
-    fgGMM.fit(foreground_pixels.reshape((-1, img.shape[-1])),labels=fg_label)
+    bgGMM.update(background_pixels.reshape((-1, img.shape[-1])))
+    fgGMM.update(foreground_pixels.reshape((-1, img.shape[-1])))
     return bgGMM, fgGMM
 
 
 def calculate_mincut(img, mask, bgGMM: GaussianMixture, fgGMM: GaussianMixture):
+    def calc_beta_smoothness():
+        _left_diff = img[:, 1:] - img[:, :-1]
+        _upleft_diff = img[1:, 1:] - img[:-1, :-1]
+        _up_diff = img[1:, :] - img[:-1, :]
+        _upright_diff = img[1:, :-1] - img[:-1, 1:]
+
+        beta = np.sum(np.square(_left_diff)) + np.sum(np.square(_upleft_diff)) + \
+               np.sum(np.square(_up_diff)) + \
+               np.sum(np.square(_upright_diff))
+        beta = 1 / (2 * beta / (
+            # Each pixel has 4 neighbors (left, upleft, up, upright)
+                4 * img.shape[1] * img.shape[0]
+                # The 1st column doesn't have left, upleft and the last column doesn't have upright
+                - 3 * img.shape[1]
+                - 3 * img.shape[0]  # The first row doesn't have upleft, up and upright
+                + 2))  # The first and last pixels in the 1st row are removed twice
+        print('Beta:', beta)
+    calc_beta_smoothness()
+
+
     global BETA, BETWEEN_EDGES, BETWEEN_WEIGHTS, K, SRC_EDGES, SINK_EDGES
 
     t1 = time.time()
@@ -197,6 +214,9 @@ def update_mask(mincut_sets, mask):
     # Reshape the flattened mask back to the original shape
     updated_mask = flat_mask.reshape(height, width)
     return updated_mask
+
+
+
 
 
 def check_convergence(energy):

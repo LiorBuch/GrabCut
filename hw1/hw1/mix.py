@@ -4,98 +4,46 @@ from sklearn.cluster import KMeans
 
 
 class GaussianMixture:
-    def __init__(self, X, n_components=5):
+    def __init__(self, data, n_components=5):
+        data = data.reshape((-1, data.shape[-1]))
         self.n_components = n_components
-        self.n_features = X.shape[1]
-        self.n_samples = np.zeros(self.n_components)
+        self.n_features = data.shape[1]
 
-        self.coefs = np.zeros(self.n_components)
+        self.weights = np.zeros(self.n_components)
         self.means = np.zeros((self.n_components, self.n_features))
-        # Full covariance
-        self.covariances = np.zeros(
-            (self.n_components, self.n_features, self.n_features))
+        self.covariances = np.zeros((self.n_components, self.n_features, self.n_features))
+        self.kmeans = KMeans(n_clusters=self.n_components, n_init=1)
+        self.kmeans.fit(data)
+        self.update(data)
 
-        self.init_with_kmeans(X)
+    def calc_prob(self, data):
+        data = data.reshape((-1, data.shape[-1]))
+        prob = []
+        for comp in range(self.n_components):
+            score = np.zeros(data.shape[0])
+            if self.weights[comp] > 0:
+                diff = data - self.means[comp]
+                mult = np.einsum('ij,ij->i', diff, np.dot(np.linalg.inv(self.covariances[comp]), diff.T).T)
+                score = (np.exp(-.5 * mult) / np.sqrt(2 * np.pi)) / np.sqrt(np.linalg.det(self.covariances[comp]))
+            prob.append(score)
 
-    def init_with_kmeans(self, X):
-        label = KMeans(n_clusters=self.n_components, n_init=1).fit(X).labels_
-        self.fit(X, label)
+        return np.dot(self.weights, prob)
 
-    def calc_score(self, X, ci):
-        """Predict probabilities of samples belong to component ci
+    def update(self, data):
+        data = data.reshape((-1, data.shape[-1]))
+        labels = self.kmeans.fit(data).labels_
+        comp_data = np.zeros(self.n_components)
+        self.weights = np.zeros(self.n_components)
 
-        Parameters
-        ----------
-        X : array, shape (n_samples, n_features)
+        components, count = np.unique(labels, return_counts=True)
+        comp_data[components] = count
 
-        ci : int
+        for comp in components:
+            n = comp_data[comp]
 
-        Returns
-        -------
-        score : array, shape (n_samples,)
-        """
-        score = np.zeros(X.shape[0])
-        if self.coefs[ci] > 0:
-            diff = X - self.means[ci]
-            # _mult = diff[0].dot(np.linalg.inv(self.covariances[ci])).dot(diff[0].T)
-            # _mult = diff[1].dot(np.linalg.inv(self.covariances[ci])).dot(diff[1].T)
-            mult = np.einsum(
-                'ij,ij->i', diff, np.dot(np.linalg.inv(self.covariances[ci]), diff.T).T)
-            score = np.exp(-.5 * mult) / np.sqrt(2 * np.pi) / \
-                np.sqrt(np.linalg.det(self.covariances[ci]))
-
-        return score
-
-    def calc_prob(self, X):
-        """Predict probability (weighted score) of samples belong to the GMM
-
-        Parameters
-        ----------
-        X : array, shape (n_samples, n_features)
-
-        Returns
-        -------
-        prob : array, shape (n_samples,)
-        """
-        prob = [self.calc_score(X, ci) for ci in range(self.n_components)]
-        return np.dot(self.coefs, prob)
-
-    def which_component(self, X):
-        """Predict samples belong to which GMM component
-
-        Parameters
-        ----------
-        X : array, shape (n_samples, n_features)
-
-        Returns
-        -------
-        comp : array, shape (n_samples,)
-        """
-        prob = np.array([self.calc_score(X, ci)
-                         for ci in range(self.n_components)]).T
-        # print(prob)
-        return np.argmax(prob, axis=1)
-
-    def fit(self, X, labels):
-        assert self.n_features == X.shape[1]
-
-        self.n_samples[:] = 0
-        self.coefs[:] = 0
-
-        uni_labels, count = np.unique(labels, return_counts=True)
-        self.n_samples[uni_labels] = count
-
-        variance = 0.01
-        for ci in uni_labels:
-            n = self.n_samples[ci]
-
-            self.coefs[ci] = n / np.sum(self.n_samples)
-            self.means[ci] = np.mean(X[ci == labels], axis=0)
-            self.covariances[ci] = 0 if self.n_samples[ci] <= 1 else np.cov(
-                X[ci == labels].T)
-
-            det = np.linalg.det(self.covariances[ci])
-            if det <= 0:
-                # Adds the white noise to avoid singular covariance matrix.
-                self.covariances[ci] += np.eye(self.n_features) * variance
-                det = np.linalg.det(self.covariances[ci])
+            self.weights[comp] = n / np.sum(comp_data)
+            self.means[comp] = np.mean(data[comp == labels], axis=0)
+            self.covariances[comp] = 0 if comp_data[comp] <= 1 else np.cov(data[comp == labels].T)
+            det = np.linalg.det(self.covariances[comp])
+            if det <= 0:  # prevent 0 values
+                self.covariances[comp] += np.eye(self.n_features) * 0.01
