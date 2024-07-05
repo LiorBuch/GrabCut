@@ -1,12 +1,10 @@
 import time
-from numba import njit
+from numba import prange
 import numpy as np
 import cv2
 import igraph as ig
 import argparse
 
-import scipy
-from sklearn.mixture import GaussianMixture
 from sklearn.cluster import KMeans
 
 GC_BGD = 0  # Hard bg pixel
@@ -37,7 +35,7 @@ class Gaussian:
             if np.linalg.det(self.covariance[i]) == 0:
                 reg_cov = 1e-6 * np.eye(len(self.covariance[i]))
                 self.covariance[i] += reg_cov
-        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in range(comp_num)])
+        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in prange(comp_num)])
         self.covariance_det = np.array([np.linalg.det(self.covariance[i]) for i in range(comp_num)])
 
     def calc_N(self, xi, mu, covariance_inverse, covariance_determinant):
@@ -50,7 +48,7 @@ class Gaussian:
     # ric
     def evaluate_responsibility_for_pixel(self, pixel: list):
         probability = np.zeros(self.comp_num)
-        for cluster_index in range(self.comp_num):
+        for cluster_index in prange(self.comp_num):
             covariance_inverse = self.covariance_inverse[cluster_index]
             covariance_determinant = self.covariance_det[cluster_index]
             N = self.calc_N(pixel, self.means[cluster_index], covariance_inverse, covariance_determinant)
@@ -76,13 +74,13 @@ class Gaussian:
 
     def fit(self, pixels):
         responsibilities = np.zeros((pixels.shape[0],5))
-        for pixel_index in range(pixels.shape[0]):
+        for pixel_index in prange(pixels.shape[0]):
                 responsibilities[pixel_index] = self.evaluate_responsibility_for_pixel(pixels[pixel_index])
 
         self.weights = np.zeros(self.comp_num)
         self.means = np.zeros((self.comp_num, 3))
         self.covariance = np.zeros((self.comp_num, 3, 3))
-        for cluster_index in range(self.comp_num):
+        for cluster_index in prange(self.comp_num):
             weight, mu, sigma = self.re_estimate_gmms_parameters(responsibilities, pixels, cluster_index)
             self.weights[cluster_index] = weight
             self.means[cluster_index] = mu
@@ -315,7 +313,7 @@ def cal_metric(predicted_mask, gt_mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='cross', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='bush', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
