@@ -82,7 +82,7 @@ class Gaussian:
         return weight, mu, sigma
 
     def fit(self, pixels):
-        responsibilities = np.zeros((pixels.shape[0],5))
+        responsibilities = np.zeros((pixels.shape[0],self.comp_num))
         for pixel_index in range(pixels.shape[0]):
                 responsibilities[pixel_index] = self.evaluate_responsibility_for_pixel(pixels[pixel_index])
 
@@ -129,7 +129,7 @@ class Gaussian:
 
 
 # Define the GrabCut algorithm function
-def grabcut(img, rect, n_iter=5):
+def grabcut(img, rect, n_iter=1):
     # Assign initial labels to the pixels based on the bounding box
     mask = np.zeros(img.shape[:2], dtype=np.uint8)
     mask.fill(GC_BGD)
