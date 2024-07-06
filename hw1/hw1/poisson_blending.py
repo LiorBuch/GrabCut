@@ -1,4 +1,5 @@
 import math
+import os
 
 import cv2
 import numpy as np
@@ -48,7 +49,7 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
                 if im_mask[i, j] >= 100:
                     A[color][idx, idx] = -4
                     # up
-                    if 0 <= i - 1 < mask_height and 0 <= j <= mask_width:
+                    if 0 <= i - 1 < mask_height and 0 <= j < mask_width:
                         if im_mask[i - 1, j] > 0:
                             A[color][idx, idx - mask_width] = 1
                             src_buffer[0] =(im_src[(i - 1), j, color] - im_src[i, j, color])
@@ -61,7 +62,7 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
                                 relative_h + i, relative_w + j, color])
 
                     # down
-                    if 0 <= i + 1 < mask_height and 0 <= j <= mask_width:
+                    if 0 <= i + 1 < mask_height and 0 <= j < mask_width:
                         if im_mask[i + 1, j] > 0:
                             A[color][idx, idx + mask_width] = 1
                             src_buffer[1] = (im_src[(i + 1), j, color] - im_src[i, j, color])
@@ -75,7 +76,7 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
                                 relative_h + i, relative_w + j, color])
 
                     # left
-                    if 0 <= i < mask_height and 0 <= j - 1 <= mask_width:
+                    if 0 <= i < mask_height and 0 <= j - 1 < mask_width:
                         if im_mask[i, j - 1] > 0:
                             A[color][idx, idx - 1] = 1
                             src_buffer[2]= (im_src[i, j - 1, color] - im_src[i, j, color])
@@ -89,7 +90,7 @@ def poisson_blend(im_src, im_tgt, im_mask, center):
                                 relative_h + i, relative_w + j, color])
 
                     # right
-                    if 0 <= i < mask_height and 0 <= j - 1 <= mask_width:
+                    if 0 <= i < mask_height and 0 <= j + 1 < mask_width:
                         if im_mask[i, j + 1] > 0:
                             A[color][idx, idx + 1] = 1
                             src_buffer[3]= (im_src[i, j + 1, color] - im_src[i, j, color])
@@ -136,11 +137,31 @@ def get_boundary(mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--src_path', type=str, default='./data/imgs/banana2.jpg', help='image file path')
-    parser.add_argument('--mask_path', type=str, default='./data/seg_GT/banana2.bmp', help='mask file path')
-    parser.add_argument('--tgt_path', type=str, default='./data/bg/wall.jpg', help='mask file path')
+    parser.add_argument('--src_path', type=str, default='./data/imgs/banana1.jpg', help='image file path')
+    parser.add_argument('--mask_path', type=str, default='./data/seg_GT/banana1.bmp', help='mask file path')
+    parser.add_argument('--tgt_path', type=str, default='./data/bg/table.jpg', help='mask file path')
     return parser.parse_args()
 
+
+def apply_results(tgt_path):
+    img_path = './data/imgs'
+    mask_path = './data/seg_GT'
+
+    # Get a list of all file names in the directory
+    img_names = os.listdir(img_path)
+    mask_names = os.listdir(mask_path)
+
+    for i in range(len(img_names)):
+        im_tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+        im_src = cv2.imread(os.path.join(img_path, img_names[i]), cv2.IMREAD_COLOR)
+
+        im_mask = cv2.imread(os.path.join(mask_path, mask_names[i]), cv2.IMREAD_GRAYSCALE)
+        im_mask = cv2.threshold(im_mask, 0, 255, cv2.THRESH_BINARY)[1]
+
+        center = (int(im_tgt.shape[1] / 2), int(im_tgt.shape[0] / 2))
+        im_clone = poisson_blend(im_src, im_tgt, im_mask, center)
+
+        cv2.imwrite(f'./data/results/{img_names[i]}', im_clone)
 
 if __name__ == "__main__":
     # Load the source and target images
@@ -162,3 +183,5 @@ if __name__ == "__main__":
     cv2.imshow('Cloned image', im_clone)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+
