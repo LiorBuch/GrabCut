@@ -1,5 +1,4 @@
 import time
-from numba import prange
 import numpy as np
 import cv2
 import igraph as ig
@@ -27,7 +26,7 @@ SINK_EDGES = []
 class Gaussian:
     def __init__(self, comp_num: int, pixels):
         self.comp_num = comp_num
-        kmeans_clusters = KMeans(n_clusters=self.comp_num, n_init=10).fit(pixels)
+        kmeans_clusters = KMeans(n_clusters=self.comp_num, n_init=1).fit(pixels)
         self.means = kmeans_clusters.cluster_centers_
         self.weights = np.array([np.sum(kmeans_clusters.labels_ == i) / len(pixels) for i in range(comp_num)])
         self.covariance = np.array([np.cov(pixels[kmeans_clusters.labels_ == i].T) for i in range(comp_num)])
@@ -35,20 +34,28 @@ class Gaussian:
             if np.linalg.det(self.covariance[i]) == 0:
                 reg_cov = 1e-6 * np.eye(len(self.covariance[i]))
                 self.covariance[i] += reg_cov
-        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in prange(comp_num)])
+        self.covariance_inverse = np.array([np.linalg.inv(self.covariance[i]) for i in range(comp_num)])
         self.covariance_det = np.array([np.linalg.det(self.covariance[i]) for i in range(comp_num)])
 
     def calc_N(self, xi, mu, covariance_inverse, covariance_determinant):
         xi_minus_mu = np.array(xi) - np.array(mu)
         xi_dimension = len(xi)
-        numerator = np.e ** (-0.5 * np.dot(np.dot(xi_minus_mu.T, covariance_inverse), xi_minus_mu))
+        exponent = -0.5 * np.dot(np.dot(xi_minus_mu.T, covariance_inverse), xi_minus_mu)
+        # Avoid overflow by clipping exponent
+        exponent = np.clip(exponent, -700, 700)
+        numerator = np.exp(exponent)
+        # Ensure positive determinant before computing its square root
+        if covariance_determinant <= 0:
+            covariance_determinant = 1e-6
+        # Ensure positive determinant before computing its square root
+        covariance_determinant = max(covariance_determinant, 1e-6)
         denominator = ((2 * np.pi) ** (xi_dimension / 2)) * (covariance_determinant ** 0.5)
         return numerator / denominator
 
     # ric
     def evaluate_responsibility_for_pixel(self, pixel: list):
         probability = np.zeros(self.comp_num)
-        for cluster_index in prange(self.comp_num):
+        for cluster_index in range(self.comp_num):
             covariance_inverse = self.covariance_inverse[cluster_index]
             covariance_determinant = self.covariance_det[cluster_index]
             N = self.calc_N(pixel, self.means[cluster_index], covariance_inverse, covariance_determinant)
@@ -57,11 +64,13 @@ class Gaussian:
             probability[cluster_index] = numerator
         # Normalize
         if sum(probability) == 0:
-            return np.ones(5)/5
+            return 0#np.ones(5)/5
         return np.array(probability) / sum(probability)
 
     def re_estimate_gmms_parameters(self, responsibility, pixels, cluster_index):
         sum_ric = np.sum(responsibility[:, cluster_index])
+        if sum_ric == 0:
+            sum_ric = 1e-10  # Add a small value to prevent division by zero
         mu = np.sum(pixels * responsibility[:, cluster_index].reshape(-1, 1), axis=0) / sum_ric
 
         weight = sum_ric / len(pixels)
@@ -74,13 +83,13 @@ class Gaussian:
 
     def fit(self, pixels):
         responsibilities = np.zeros((pixels.shape[0],5))
-        for pixel_index in prange(pixels.shape[0]):
+        for pixel_index in range(pixels.shape[0]):
                 responsibilities[pixel_index] = self.evaluate_responsibility_for_pixel(pixels[pixel_index])
 
         self.weights = np.zeros(self.comp_num)
         self.means = np.zeros((self.comp_num, 3))
         self.covariance = np.zeros((self.comp_num, 3, 3))
-        for cluster_index in prange(self.comp_num):
+        for cluster_index in range(self.comp_num):
             weight, mu, sigma = self.re_estimate_gmms_parameters(responsibilities, pixels, cluster_index)
             self.weights[cluster_index] = weight
             self.means[cluster_index] = mu
@@ -103,17 +112,18 @@ class Gaussian:
 
             # Calculate exponent part more stably
             exponent = -0.5 * np.dot(np.dot(x_minus_u, self.covariance_inverse[cluster_index]), x_minus_u)
-
+            # Avoid overflow by clipping exponent
+            exponent = np.clip(exponent, -700, 700)
+            denominator = ((2 * np.pi) ** (len(pixel) / 2)) * np.sqrt(max(self.covariance_det[cluster_index], 1e-6))
             # Calculate probability density for the current component
-            prob_density = (self.weights[cluster_index] / ((2 * np.pi) ** (len(pixel) / 2) * np.sqrt(
-                self.covariance_det[cluster_index]))) * np.exp(exponent)
+            prob_density = (self.weights[cluster_index] / (denominator)) * np.exp(exponent)
 
             pixel_probability += prob_density
 
         # Avoid log(0) by ensuring pixel_probability is positive
         if pixel_probability <= 0:
-            global K
-            return K
+            #global K
+            return 0#K
 
         return -np.log(pixel_probability)
 
@@ -224,21 +234,21 @@ def calculate_mincut(img, mask, bgGMM: Gaussian, fgGMM: Gaussian):
                 K = max(K, sum_n)
         print(f"K={K}")
 
-    bg_weights = []  # bg
-    fg_weights = []  # fg
+    bg_weights = np.zeros(height * width)  # bg
+    fg_weights = np.zeros(height * width)  # fg
 
     for row_index in range(0, height):
         for col_index in range(0, width):
             if mask[row_index][col_index] == GC_BGD:
-                bg_weights.append(K)  # if we know its bg, the weight should be K
-                fg_weights.append(0)
+                bg_weights[row_index*width + col_index] = K  # if we know its bg, the weight should be K
+                fg_weights[row_index*width + col_index] = 0
             elif mask[row_index][col_index] == GC_FGD:
-                bg_weights.append(0)
-                fg_weights.append(K)  # if we know its fg, the weight should be K
+                bg_weights[row_index*width + col_index] = 0
+                fg_weights[row_index*width + col_index] = K  # if we know its fg, the weight should be K
             else:  # If the mask is 2 or 3, use the prob
                 # TODO: Check if should be bg-fg instead
-                bg_weights.append(fgGMM.score_sample(img[row_index][col_index]))
-                fg_weights.append(bgGMM.score_sample(img[row_index][col_index]))
+                bg_weights[row_index*width + col_index] = fgGMM.score_sample(img[row_index][col_index])
+                fg_weights[row_index*width + col_index] = bgGMM.score_sample(img[row_index][col_index])
 
     g.add_edges(SRC_EDGES)
     g.add_edges(SINK_EDGES)
@@ -295,7 +305,7 @@ def check_convergence(energy):
         print("")
         return False
     print(f"energy conver -> {np.abs(energy - PREV_ENERGY) / PREV_ENERGY} \n")
-    result = (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.0001 or LOOP_TRACK == 20  # TODO: Update this value
+    result = energy == 0 or (np.abs(energy - PREV_ENERGY) / PREV_ENERGY) <= 0.0001 or LOOP_TRACK == 20  # TODO: Update this value
     PREV_ENERGY = energy
     return result
 
@@ -313,7 +323,7 @@ def cal_metric(predicted_mask, gt_mask):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_name', type=str, default='bush', help='name of image from the course files')
+    parser.add_argument('--input_name', type=str, default='sheep', help='name of image from the course files')
     parser.add_argument('--eval', type=int, default=1, help='calculate the metrics')
     parser.add_argument('--input_img_path', type=str, default='', help='if you wish to use your own img_path')
     parser.add_argument('--use_file_rect', type=int, default=1, help='Read rect from course files')
@@ -322,7 +332,7 @@ def parse():
 
 
 if __name__ == '__main__':
-
+    start_time = time.time()
     # Load an example image and define a bounding box around the object of interest
     args = parse()
 
@@ -348,7 +358,8 @@ if __name__ == '__main__':
         gt_mask = cv2.threshold(gt_mask, 0, 1, cv2.THRESH_BINARY)[1]
         acc, jac = cal_metric(mask, gt_mask)
         print(f'Accuracy={acc}, Jaccard={jac}')
-
+    end_time = time.time()
+    print(f"Took {end_time - start_time} seconds")
     # Apply the final mask to the input image and display the results
     img_cut = img * (mask[:, :, np.newaxis])
     cv2.imshow('Original Image', img)
